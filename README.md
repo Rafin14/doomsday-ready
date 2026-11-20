@@ -101,4 +101,4 @@ erDiagram
 
 ## AI assistance
 
-OpenAI Codex generated the initial application and assisted with the UI, algorithms, tests, Docker setup, and documentation. A separate Codex agent reviewed the code and designed edge cases. Codex ran the checks and fixed issues found during verification. The two assessment algorithms are implemented directly in JavaScript without a graph or optimization library.
+I used OpenAI Codex to assist with generating and refining the initial implementation.
