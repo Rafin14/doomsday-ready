@@ -1,6 +1,7 @@
 import express from 'express';
 import { bookingQuote, rewatchOrder } from './algorithms.js';
 import { transaction } from './db.js';
+import { currentReleaseYear, MAX_RUNTIME_MINUTES, MIN_RELEASE_YEAR } from '../shared/movie-rules.js';
 
 class ApiError extends Error {
   constructor(status, code, message) {
@@ -34,17 +35,24 @@ function nameField(value, label) {
 
 function movieInput(body, existing) {
   const fields = ['title', 'releaseYear', 'runtimeMinutes', 'watched', 'prerequisiteIds'];
-  const data = { watched: false, prerequisiteIds: [], ...existing, ...objectBody(body, fields) };
-  data.title = nameField(data.title, 'Title');
-  if (!integerIn(data.releaseYear, 1, 9999)) invalid('Release year must be a whole year from 1 to 9999.');
-  if (!integerIn(data.runtimeMinutes, 1, 300)) invalid('Runtime must be a whole number from 1 to 300 minutes.');
+  const changes = objectBody(body, fields);
+  const data = { watched: false, prerequisiteIds: [], ...existing, ...changes };
+  const title = nameField(data.title, 'Title');
+  const latestYear = currentReleaseYear();
+  // Existing records keep their release year until a request explicitly replaces it.
+  if ((!existing || Object.hasOwn(changes, 'releaseYear'))
+    && !integerIn(data.releaseYear, MIN_RELEASE_YEAR, latestYear)) {
+    invalid(`Release year must be a whole year from ${MIN_RELEASE_YEAR} to ${latestYear}.`);
+  }
+  if (!integerIn(data.runtimeMinutes, 1, MAX_RUNTIME_MINUTES)) {
+    invalid(`Runtime must be a whole number from 1 to ${MAX_RUNTIME_MINUTES} minutes.`);
+  }
   if (typeof data.watched !== 'boolean') invalid('Watched must be true or false.');
   const ids = data.prerequisiteIds;
   if (!Array.isArray(ids) || !ids.every(id => integerIn(id, 1, Number.MAX_SAFE_INTEGER))) {
     invalid('Prerequisites must be an array of positive movie IDs.');
   }
-  data.prerequisiteIds = [...new Set(ids)].sort((a, b) => a - b);
-  return data;
+  return { ...data, title, prerequisiteIds: [...new Set(ids)].sort((a, b) => a - b) };
 }
 
 export function createApp(db) {

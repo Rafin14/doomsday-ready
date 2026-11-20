@@ -1,7 +1,8 @@
+// Return prerequisite IDs in postorder, or null when the target reaches a cycle.
 export function rewatchOrder(target, prerequisites) {
   const order = [];
-  const active = new Set([target]);
-  const done = new Set();
+  const onPath = new Set([target]);
+  const visited = new Set();
   const stack = [{ id: target, remaining: (prerequisites.get(target) ?? []).values() }];
 
   while (stack.length) {
@@ -9,13 +10,13 @@ export function rewatchOrder(target, prerequisites) {
     const next = remaining.next();
     if (next.done) {
       stack.pop();
-      active.delete(id);
-      done.add(id);
+      onPath.delete(id);
+      visited.add(id);
       if (id !== target) order.push(id);
-    } else if (active.has(next.value)) {
+    } else if (onPath.has(next.value)) {
       return null;
-    } else if (!done.has(next.value)) {
-      active.add(next.value);
+    } else if (!visited.has(next.value)) {
+      onPath.add(next.value);
       stack.push({ id: next.value, remaining: (prerequisites.get(next.value) ?? []).values() });
     }
   }
@@ -23,6 +24,7 @@ export function rewatchOrder(target, prerequisites) {
 }
 
 export function bookingQuote(sizes, groupSize) {
+  // Each reachable seat total keeps the cheapest count and the final bundle used.
   const fewest = Array(groupSize + 1).fill(Infinity);
   const lastBundle = Array(groupSize + 1);
   const descending = sizes.toSorted((a, b) => b - a);

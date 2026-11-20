@@ -3,31 +3,38 @@ import { once } from 'node:events';
 import { mkdtempSync, rmSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, before, test } from 'node:test';
+import { afterEach, beforeEach, test } from 'node:test';
 import { createApp } from '../server/api.js';
 import { openDatabase } from '../server/db.js';
 import { rewatchOrder } from '../server/algorithms.js';
 
-let server;
+let api;
 let db;
-let base;
 
-before(async () => {
-  db = openDatabase(':memory:');
-  server = createApp(db).listen(0, '127.0.0.1');
+async function startApi(database) {
+  const server = createApp(database).listen(0, '127.0.0.1');
   await once(server, 'listening');
-  base = `http://127.0.0.1:${server.address().port}/api`;
+  const baseUrl = `http://127.0.0.1:${server.address().port}/api`;
+  return {
+    fetch: (path, options) => fetch(baseUrl + path, options),
+    close: () => new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
+  };
+}
+
+beforeEach(async () => {
+  db = openDatabase(':memory:');
+  api = await startApi(db);
 });
 
-after(async () => {
-  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+afterEach(async () => {
+  await api.close();
   db.close();
 });
 
-async function request(path, status = 200, method = 'GET', body) {
-  const response = await fetch(base + path, {
+async function request(path, status = 200, method = 'GET', body, client = api) {
+  const response = await client.fetch(path, {
     method,
-    ...(body && { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+    ...(body !== undefined && { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   });
   const data = await response.json();
   assert.equal(response.status, status, JSON.stringify(data));
@@ -53,7 +60,7 @@ test('all seeded watch orders respect prerequisites and report the unwatched run
 });
 
 test('create and edit prerequisites, deduplicate shared ancestors, and roll back cycles', async () => {
-  const fields = { title: 'New release', releaseYear: 2027, runtimeMinutes: 100 };
+  const fields = { title: 'New release', releaseYear: 2020, runtimeMinutes: 100 };
   const directCreate = await request('/movies', 409, 'POST', { ...fields, prerequisiteIds: [9] });
   assert.equal(directCreate.code, 'CIRCULAR_DEPENDENCY');
   const created = await request('/movies', 201, 'POST', { ...fields, prerequisiteIds: [4, 3, 4] });
@@ -69,7 +76,7 @@ test('create and edit prerequisites, deduplicate shared ancestors, and roll back
 });
 
 test('invalid and duplicate records return JSON errors', async () => {
-  const fields = { title: 'Validation test', releaseYear: 2027, runtimeMinutes: 90 };
+  const fields = { title: 'Validation test', releaseYear: 2020, runtimeMinutes: 90 };
   for (const body of [{ runtimeMinutes: 301 }, { runtimeMinutes: 0 }, { watched: 'true' }, { prerequisiteIds: [999] }, { releaseYear: 2.5 }]) {
     assert.equal((await request('/movies', 400, 'POST', { ...fields, ...body })).code, 'VALIDATION_ERROR');
   }
@@ -86,6 +93,58 @@ test('invalid and duplicate records return JSON errors', async () => {
   await request('/cinemas', 409, 'POST', { name: 'starlight cinema', bundleSizes: [1] });
 });
 
+test('release-year and runtime boundaries apply on create and explicit updates', async () => {
+  const latestYear = new Date().getUTCFullYear();
+  const fields = { title: 'Year boundaries', releaseYear: latestYear, runtimeMinutes: 300 };
+  for (const releaseYear of [1887, latestYear + 1, latestYear + .5, String(latestYear), null]) {
+    const error = await request('/movies', 400, 'POST', { ...fields, releaseYear });
+    assert.equal(error.code, 'VALIDATION_ERROR');
+    assert.match(error.message, /Release year/);
+  }
+  const movie = await request('/movies', 201, 'POST', fields);
+  assert.equal(movie.releaseYear, latestYear);
+  assert.equal(movie.runtimeMinutes, 300);
+  const path = `/movies/${movie.id}`;
+  const rejected = await request(path, 400, 'PATCH', { releaseYear: latestYear + 1, watched: true });
+  assert.match(rejected.message, /Release year/);
+  assert.deepEqual((await request('/movies')).find(item => item.id === movie.id), movie);
+  const updated = await request(path, 200, 'PATCH', { releaseYear: 1888, runtimeMinutes: 1 });
+  assert.equal(updated.releaseYear, 1888);
+  assert.equal(updated.runtimeMinutes, 1);
+});
+
+test('pre-existing out-of-range years can be read, edited and corrected', async () => {
+  const releaseYear = new Date().getUTCFullYear() + 1;
+  const { lastInsertRowid: id } = db.prepare(
+    'INSERT INTO movies (title, release_year, runtime_minutes) VALUES (?, ?, ?)',
+  ).run('Legacy release', releaseYear, 90);
+  assert.equal((await request('/movies')).find(movie => movie.id === id).releaseYear, releaseYear);
+  const path = `/movies/${id}`;
+  const updated = await request(path, 200, 'PATCH', { watched: true, prerequisiteIds: [1] });
+  assert.equal(updated.releaseYear, releaseYear);
+  assert.equal(updated.watched, true);
+  assert.deepEqual(updated.prerequisiteIds, [1]);
+  assert.equal((await request(path, 200, 'PATCH', { releaseYear: 2020 })).releaseYear, 2020);
+});
+
+test('malformed requests return JSON errors without mutating records', async () => {
+  for (const [body, type, status] of [
+    ['{', 'application/json', 400],
+    ['null', 'application/json', 400],
+    ['{}', 'application/json; charset=latin1', 415],
+    [JSON.stringify({ title: 'x'.repeat(110_000) }), 'application/json', 413],
+  ]) {
+    const response = await api.fetch('/movies', { method: 'POST', headers: { 'Content-Type': type }, body });
+    assert.equal(response.status, status);
+    assert.equal((await response.json()).code, 'INVALID_REQUEST');
+  }
+  for (const body of [[], {}, { unexpected: true }]) {
+    assert.equal((await request('/movies', 400, 'POST', body)).code, 'VALIDATION_ERROR');
+  }
+  assert.equal((await request('/unknown', 404)).code, 'NOT_FOUND');
+  assert.equal((await request('/movies')).length, 8);
+});
+
 test('all four example quotes and the maximum group size', async () => {
   const examples = [
     [1, 6, 2, [{ size: 3, quantity: 2 }]],
@@ -97,12 +156,37 @@ test('all four example quotes and the maximum group size', async () => {
       { possible: true, groupSize, bundleCount, bundles });
   }
   assert.deepEqual(await request('/cinemas/4/booking?groupSize=7'), { possible: false, groupSize: 7 });
+  assert.deepEqual(await request('/cinemas/1/booking?groupSize=1'), {
+    possible: true, groupSize: 1, bundleCount: 1, bundles: [{ size: 1, quantity: 1 }],
+  });
+  const tie = await request('/cinemas', 201, 'POST', { name: 'Tie quote', bundleSizes: [1, 2, 3] });
+  assert.deepEqual(await request(`/cinemas/${tie.id}/booking?groupSize=4`), {
+    possible: true, groupSize: 4, bundleCount: 2, bundles: [{ size: 3, quantity: 1 }, { size: 1, quantity: 1 }],
+  });
+  const tenSizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 500];
+  assert.deepEqual((await request('/cinemas', 201, 'POST', { name: 'Ten bundles', bundleSizes: tenSizes })).bundleSizes, tenSizes);
   const cinema = await request('/cinemas', 201, 'POST', { name: 'Maximum', bundleSizes: [500, 1] });
   assert.deepEqual(cinema.bundleSizes, [1, 500]);
   assert.deepEqual((await request('/cinemas')).at(-1), cinema);
   assert.deepEqual(await request(`/cinemas/${cinema.id}/booking?groupSize=10000`), {
     possible: true, groupSize: 10000, bundleCount: 20, bundles: [{ size: 500, quantity: 20 }],
   });
+});
+
+test('duplicate movie and cinema names stay unique during simultaneous requests', async () => {
+  for (const [path, body] of [
+    ['/movies', { title: 'Concurrent movie', releaseYear: 2020, runtimeMinutes: 90 }],
+    ['/cinemas', { name: 'Concurrent cinema', bundleSizes: [1] }],
+  ]) {
+    const responses = await Promise.all(Array.from({ length: 2 }, () => api.fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })));
+    assert.deepEqual(responses.map(response => response.status).toSorted(), [201, 409]);
+    const conflict = responses.find(response => response.status === 409);
+    assert.equal((await conflict.json()).code, 'DUPLICATE_NAME');
+  }
 });
 
 test('a long prerequisite chain does not exhaust the JavaScript call stack', () => {
@@ -115,21 +199,40 @@ test('a long prerequisite chain does not exhaust the JavaScript call stack', () 
   assert.equal(rewatchOrder(0, chain), null);
 });
 
-test('database reopens with changes and seeds only once', () => {
+test('database reopens with movies, links and cinemas and seeds only once', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'doomsday-'));
   const file = join(directory, 'test.sqlite');
   try {
-    const first = openDatabase(file);
+    const firstDatabase = openDatabase(file);
+    const first = await startApi(firstDatabase);
+    let movieId;
+    let cinemaId;
     try {
-      first.prepare('UPDATE movies SET watched = 1 WHERE id = 1').run();
+      const movie = await request('/movies', 201, 'POST', {
+        title: 'Saved release', releaseYear: 2020, runtimeMinutes: 88,
+      }, first);
+      movieId = movie.id;
+      await request(`/movies/${movieId}`, 200, 'PATCH', { watched: true, prerequisiteIds: [3] }, first);
+      cinemaId = (await request('/cinemas', 201, 'POST', { name: 'Saved cinema', bundleSizes: [7] }, first)).id;
     } finally {
-      first.close();
+      await first.close();
+      firstDatabase.close();
     }
     const reopened = openDatabase(file);
+    const second = await startApi(reopened);
     try {
-      assert.equal(reopened.prepare('SELECT watched FROM movies WHERE id = 1').get().watched, 1);
-      assert.equal(reopened.prepare('SELECT count(*) AS count FROM movies').get().count, 8);
+      const movies = await request('/movies', 200, 'GET', undefined, second);
+      assert.equal(movies.length, 9);
+      const movie = movies.find(item => item.id === movieId);
+      assert.equal(movie.watched, true);
+      assert.deepEqual(movie.prerequisiteIds, [3]);
+      const plan = await request(`/movies/${movieId}/rewatch-order`, 200, 'GET', undefined, second);
+      assert.deepEqual(plan.order.map(item => item.id), [1, 2, 3]);
+      const cinemas = await request('/cinemas', 200, 'GET', undefined, second);
+      assert.equal(cinemas.length, 5);
+      assert.deepEqual(cinemas.find(cinema => cinema.id === cinemaId).bundleSizes, [7]);
     } finally {
+      await second.close();
       reopened.close();
     }
   } finally {
